@@ -203,7 +203,7 @@ impl<'a> Builder<'a> {
         cmd.arg("--target").arg(target.triple());
 
         self.apply_common_build_args(&mut cmd);
-        self.apply_env(&mut cmd);
+        self.apply_env_for_target(&mut cmd, target);
         cmd.args(&command_args.command_args);
 
         if target.platform() == Platform::Android {
@@ -239,6 +239,33 @@ impl<'a> Builder<'a> {
         self.options.env.iter().for_each(|(key, value)| {
             command.env(key, value);
         });
+    }
+
+    /// Like [`apply_env`](Self::apply_env) but strips iOS-specific env vars
+    /// when building for non-iOS targets. `IPHONEOS_DEPLOYMENT_TARGET` is
+    /// needed by cc-rs for iOS targets (zstd-sys/lz4-sys via polars) but
+    /// confuses aws-lc-sys's compiler probe on macOS/Android targets, causing
+    /// "COMPILER BUG DETECTED" panics when the probe sees "iOS" targeting on
+    /// a macOS build.
+    fn apply_env_for_target(&self, command: &mut Command, target: &RustTarget) {
+        let is_ios = matches!(
+            target.platform(),
+            crate::target::Platform::Ios | crate::target::Platform::IosSimulator
+        );
+        for (key, value) in &self.options.env {
+            // IPHONEOS_DEPLOYMENT_TARGET is iOS-only; cc-rs reads it unconditionally
+            // and it breaks aws-lc-sys's host-platform compiler probe on non-iOS targets.
+            if !is_ios && key == "IPHONEOS_DEPLOYMENT_TARGET" {
+                // Explicitly remove it in case it's inherited from the parent process env.
+                command.env_remove(key);
+                continue;
+            }
+            command.env(key, value);
+        }
+        // Also clear inherited env vars for non-iOS targets.
+        if !is_ios {
+            command.env_remove("IPHONEOS_DEPLOYMENT_TARGET");
+        }
     }
 
     fn cargo_build_command_args(&self) -> CargoBuildCommandArgs {
