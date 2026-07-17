@@ -1,6 +1,8 @@
 use boltffi_backend::{
     Error,
-    target::kotlin::{KotlinApiStyle, KotlinCustomMapping, KotlinFactoryStyle, KotlinHost},
+    target::kotlin::{
+        KotlinApiStyle, KotlinCustomMapping, KotlinDesktopLoader, KotlinFactoryStyle, KotlinHost,
+    },
 };
 
 use super::{
@@ -16,6 +18,27 @@ fn kotlin_target_renders_primitive_function_stack() {
 #[test]
 fn kotlin_target_renders_shared_runtime_support() {
     insta::assert_snapshot!(rendered_fixture_with_runtime("exports/primitive_functions"));
+}
+
+#[test]
+fn kotlin_target_closes_native_loader_if_body_when_desktop_loader_is_none() {
+    let host = KotlinHost::new("com.boltffi.demo", "Demo")
+        .expect("Kotlin host")
+        .desktop_loader(KotlinDesktopLoader::None);
+
+    let files = files_with_host(&fixture("exports/primitive_functions"), host);
+    let (_, contents) = files
+        .iter()
+        .find(|(path, _)| path.ends_with(".kt"))
+        .expect("Kotlin target should render a Kotlin source file");
+
+    let open_braces = contents.matches('{').count();
+    let close_braces = contents.matches('}').count();
+    assert_eq!(
+        open_braces, close_braces,
+        "unbalanced braces ({open_braces} open, {close_braces} close) when desktop_loader is \
+         none:\n{contents}"
+    );
 }
 
 #[test]
