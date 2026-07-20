@@ -5,8 +5,11 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 
-use crate::cli::Result;
+use crate::cli::{CliError, Result};
 use crate::config::Config;
+use crate::pack::java::link::{
+    NativeLinkMetadata, extract_link_search_paths, extract_native_static_libraries,
+};
 use crate::target::{Platform, RustTarget};
 use crate::toolchain::{AndroidToolchain, AndroidToolchainError};
 
@@ -207,6 +210,94 @@ impl<'a> Builder<'a> {
             triple: triple.to_string(),
             success,
         }])
+    }
+
+    /// Queries `cargo rustc --print=native-static-libs` for a single Android target so
+    /// callers can thread the crate graph's actual native library requirements (e.g.
+    /// `-lnativewindow` pulled in by a transitive dependency) into a manually-driven
+    /// `clang -shared` link step. Android packaging builds the Rust code as a staticlib
+    /// and links the final `.so` itself (see `pack::android::link`), which otherwise
+    /// bypasses Cargo's own linking and any native libs it would have passed along.
+    ///
+    /// This mirrors `pack::java::link::query_native_link_metadata`, adapted for Android:
+    /// it applies the same target env vars (`CARGO_TARGET_*_LINKER`, `AR`,
+    /// `BINDGEN_EXTRA_CLANG_ARGS`, ...) as the real Android build via
+    /// [`AndroidToolchain::configure_cargo_for_target`], so the query reflects the same
+    /// crate graph/config as the actual build.
+    pub fn query_native_static_libs(
+        &self,
+        target: &RustTarget,
+        android_toolchain: &AndroidToolchain,
+    ) -> Result<NativeLinkMetadata> {
+        let command_args = self.cargo_build_command_args();
+        let mut cmd = Command::new("cargo");
+
+        if let Some(toolchain_selector) = command_args.toolchain_selector.as_deref() {
+            cmd.arg(toolchain_selector);
+        }
+
+        // `cargo build` doesn't support `--print`, so this query always uses `cargo rustc`,
+        // regardless of `BuildSelection` -- unlike `apply_cargo_build_prefix`, which only
+        // picks `rustc` for `BuildSelection::Expanded`.
+        cmd.arg("rustc").arg("--target").arg(target.triple());
+
+        self.apply_common_build_args(&mut cmd);
+        self.apply_env_for_target(&mut cmd, target);
+        cmd.args(&command_args.command_args);
+        cmd.arg("--message-format=json-render-diagnostics");
+
+        android_toolchain.configure_cargo_for_target(&mut cmd, target)?;
+
+        let is_expanded = matches!(&self.options.selection, BuildSelection::Expanded(_));
+        if !is_expanded {
+            cmd.arg("--lib");
+        }
+        self.apply_expansion(&mut cmd)?;
+        if !is_expanded {
+            // `apply_expansion` is a no-op for non-expanded selections, so this query has
+            // to add its own `--` separator before the rustc-only `--print` flag below --
+            // the JVM equivalent, `query_native_link_metadata`, does the same for its
+            // `None` binding-expansion branch.
+            cmd.arg("--");
+        }
+        cmd.arg("--print=native-static-libs");
+
+        let output = cmd.output().map_err(|source| CliError::CommandFailed {
+            command: format!(
+                "cargo rustc --print=native-static-libs for android target '{}': {source}",
+                target.triple()
+            ),
+            status: None,
+        })?;
+
+        if !output.status.success() {
+            return Err(CliError::CommandFailed {
+                command: format!(
+                    "cargo rustc --print=native-static-libs for android target '{}'",
+                    target.triple()
+                ),
+                status: output.status.code(),
+            });
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{stdout}\n{stderr}");
+        let native_link_search_paths = extract_link_search_paths(&stdout);
+        let native_static_libraries = extract_native_static_libraries(&combined).ok_or_else(|| {
+            CliError::CommandFailed {
+                command: format!(
+                    "cargo rustc --print=native-static-libs did not emit link metadata for android target '{}'",
+                    target.triple()
+                ),
+                status: None,
+            }
+        })?;
+
+        Ok(NativeLinkMetadata {
+            native_static_libraries,
+            native_link_search_paths,
+        })
     }
 
     fn build_single_target(

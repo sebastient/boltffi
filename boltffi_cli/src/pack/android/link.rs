@@ -2,14 +2,32 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::build::{BindingExpansion, BuildOptions, BuildSelection, Builder};
 use crate::cli::{CliError, Result};
 use crate::config::Config;
 use crate::pack::PackError;
+use crate::pack::java::link::link_search_path_flags;
+use crate::pack::print_cargo_line;
 use crate::pack::symbols::{DebugSymbolArtifact, DebugSymbolArtifactKind, write_debug_symbols_zip};
 use crate::target::{BuiltLibrary, Platform, RustTarget};
 use crate::toolchain::AndroidToolchain;
 
 use super::AndroidBindingMode;
+
+/// Native libraries already hardcoded into [`android_shared_link_args`]'s baseline. Flags
+/// reported by `cargo rustc --print=native-static-libs` that exactly match one of these are
+/// dropped so the final linker invocation doesn't pass true duplicates.
+const HARDCODED_ANDROID_BASELINE_LIBS: [&str; 4] = ["-lc", "-lm", "-llog", "-ldl"];
+
+/// Optional cargo build context that lets [`AndroidPackager`] ask Cargo (via
+/// `cargo rustc --print=native-static-libs`) what native libraries the staticlib actually
+/// requires, so those libraries can be threaded into the manual `clang -shared` link step
+/// alongside the historical hardcoded baseline. See [`AndroidPackager::with_build_context`].
+#[derive(Debug, Clone, Default)]
+struct AndroidBuildContext {
+    binding_expansion: Option<BindingExpansion>,
+    cargo_args: Vec<String>,
+}
 
 pub struct AndroidPackager<'a> {
     config: &'a Config,
@@ -17,6 +35,7 @@ pub struct AndroidPackager<'a> {
     release: bool,
     binding_mode: AndroidBindingMode,
     layout: AndroidPackageLayout,
+    build_context: Option<AndroidBuildContext>,
 }
 
 /// Paths used while compiling and staging Android JNI libraries.
@@ -63,7 +82,28 @@ impl<'a> AndroidPackager<'a> {
             release,
             binding_mode,
             layout,
+            build_context: None,
         }
+    }
+
+    /// Supplies the cargo build context (a resolved [`BindingExpansion`] and/or pass-through
+    /// cargo args) needed to query `cargo rustc --print=native-static-libs` for each Android
+    /// target during linking, so additional native libraries required by the crate graph
+    /// (e.g. `-lnativewindow`) reach the final `.so` link instead of only the hardcoded
+    /// baseline (`-lm -llog -ldl`, plus the implicit `-lc`).
+    ///
+    /// This is opt-in: without calling this, [`AndroidPackager`] behaves exactly as before
+    /// (hardcoded baseline libs only).
+    pub fn with_build_context(
+        mut self,
+        binding_expansion: Option<BindingExpansion>,
+        cargo_args: Vec<String>,
+    ) -> Self {
+        self.build_context = Some(AndroidBuildContext {
+            binding_expansion,
+            cargo_args,
+        });
+        self
     }
 
     pub fn package(self) -> Result<AndroidOutput> {
@@ -209,12 +249,15 @@ impl<'a> AndroidPackager<'a> {
 
         write_android_export_version_script(&export_script_path)?;
 
+        let extra_link_flags = self.extra_link_flags(&library.target, android_toolchain)?;
+
         let mut link = Command::new(&clang);
         link.args(android_shared_link_args(
             &dest_path,
             &object_path,
             &library.path,
             &export_script_path,
+            &extra_link_flags,
         ));
         run_command(link)?;
 
@@ -223,6 +266,68 @@ impl<'a> AndroidPackager<'a> {
             abi,
             path: dest_path,
         })
+    }
+
+    /// Resolves the extra `-L`/`-l...` flags that should be threaded into the manual
+    /// `clang -shared` link step, on top of the hardcoded baseline in
+    /// [`android_shared_link_args`].
+    ///
+    /// Returns an empty list when no build context was supplied via
+    /// [`Self::with_build_context`] (the pre-existing, hardcoded-only behavior).
+    ///
+    /// If a build context was supplied but the `cargo rustc --print=native-static-libs`
+    /// query itself fails to run (e.g. an NDK/toolchain issue, or an unresolved `cargo`
+    /// invocation while offline), this deliberately does NOT fail the whole `pack android`
+    /// command: it warns and falls back to the hardcoded baseline instead, so this feature
+    /// stays a strict improvement and never becomes a new failure mode on its own. Unlike
+    /// that subprocess-level failure, a *genuinely* missing native library is still caught
+    /// -- at actual link time, as a hard build failure -- by `-Wl,--no-undefined` in
+    /// [`android_shared_link_args`], which is the more appropriate place to fail loudly
+    /// since a missing symbol here would otherwise ship a `.so` that crashes silently on
+    /// device.
+    fn extra_link_flags(
+        &self,
+        target: &RustTarget,
+        android_toolchain: &AndroidToolchain,
+    ) -> Result<Vec<String>> {
+        let Some(build_context) = &self.build_context else {
+            return Ok(Vec::new());
+        };
+
+        let selection = match &build_context.binding_expansion {
+            Some(binding_expansion) => {
+                BuildSelection::Expanded(Box::new(binding_expansion.clone()))
+            }
+            None => BuildSelection::Default {
+                cargo_args: build_context.cargo_args.clone(),
+            },
+        };
+        let builder = Builder::new(
+            self.config,
+            BuildOptions {
+                release: self.release,
+                selection,
+                on_output: None,
+            },
+        );
+
+        match builder.query_native_static_libs(target, android_toolchain) {
+            Ok(metadata) => {
+                let mut flags = link_search_path_flags(&metadata.native_link_search_paths);
+                flags.extend(filter_redundant_hardcoded_libs(
+                    &metadata.native_static_libraries,
+                ));
+                Ok(flags)
+            }
+            Err(error) => {
+                print_cargo_line(&format!(
+                    "warning: failed to query native-static-libs for android target '{}': {error}; \
+                     falling back to the hardcoded baseline native libraries (-lm -llog -ldl)",
+                    target.triple()
+                ));
+                Ok(Vec::new())
+            }
+        }
     }
 
     fn android_library_name(&self) -> String {
@@ -318,13 +423,26 @@ fn write_android_debug_symbols(
     )
 }
 
+/// Removes flags that exactly duplicate [`HARDCODED_ANDROID_BASELINE_LIBS`] from a list of
+/// native-static-libs flags reported by `cargo rustc --print=native-static-libs`, so the
+/// final linker invocation doesn't pass true duplicates. Everything else (e.g.
+/// `-lnativewindow`, `-landroid`, `-lgcc`, ...) passes through unchanged.
+fn filter_redundant_hardcoded_libs(native_static_libraries: &[String]) -> Vec<String> {
+    native_static_libraries
+        .iter()
+        .filter(|flag| !HARDCODED_ANDROID_BASELINE_LIBS.contains(&flag.as_str()))
+        .cloned()
+        .collect()
+}
+
 fn android_shared_link_args(
     dest_path: &Path,
     object_path: &Path,
     library_path: &Path,
     export_script_path: &Path,
+    extra_link_flags: &[String],
 ) -> Vec<OsString> {
-    vec![
+    let mut args = vec![
         OsString::from("-shared"),
         OsString::from("-o"),
         dest_path.as_os_str().to_os_string(),
@@ -332,16 +450,29 @@ fn android_shared_link_args(
         OsString::from("-Wl,--whole-archive"),
         library_path.as_os_str().to_os_string(),
         OsString::from("-Wl,--no-whole-archive"),
+    ];
+    // Additional `-L`/`-l...` flags Cargo reports as required by the crate graph (e.g.
+    // `-lnativewindow`), on top of the hardcoded baseline below. These aren't part of the
+    // `--whole-archive` block above, so their placement relative to it doesn't matter for
+    // `-l` resolution.
+    args.extend(extra_link_flags.iter().map(OsString::from));
+    args.extend([
         OsString::from("-Xlinker"),
         OsString::from("--version-script"),
         OsString::from("-Xlinker"),
         export_script_path.as_os_str().to_os_string(),
         OsString::from("-Wl,--gc-sections"),
         OsString::from("-Wl,-z,nodelete"),
+        // Fail the build loudly if any symbol -- including ones from a crate-declared
+        // `extern "C"` FFI binding several dependency layers down -- is still undefined
+        // after linking, instead of silently shipping a `.so` that crashes at runtime when
+        // the dynamic linker can't resolve it on-device.
+        OsString::from("-Wl,--no-undefined"),
         OsString::from("-lm"),
         OsString::from("-llog"),
         OsString::from("-ldl"),
-    ]
+    ]);
+    args
 }
 
 fn write_android_export_version_script(path: &Path) -> Result<()> {
@@ -386,7 +517,7 @@ fn run_command(mut command: Command) -> Result<()> {
 mod tests {
     use super::{
         AndroidPackageLayout, AndroidPackager, android_export_version_script,
-        android_jni_compile_args, android_shared_link_args,
+        android_jni_compile_args, android_shared_link_args, filter_redundant_hardcoded_libs,
     };
     use crate::config::Config;
     use crate::pack::android::AndroidBindingMode;
@@ -706,6 +837,7 @@ enabled = true
             Path::new("/tmp/out/jni_glue.o"),
             Path::new("/tmp/out/libdemo.a"),
             Path::new("/tmp/out/exports.map"),
+            &[],
         );
 
         assert!(!args.contains(&OsString::from("-Wl,--exclude-libs,ALL")));
@@ -721,11 +853,60 @@ enabled = true
             Path::new("/tmp/out/jni_glue.o"),
             Path::new("/tmp/out/libdemo.a"),
             Path::new("/tmp/out/exports.map"),
+            &[],
         );
 
         assert!(
             args.contains(&OsString::from("-Wl,-z,nodelete")),
             "Android JNI libraries should stay mapped so pthread TLS destructors remain callable"
+        );
+    }
+
+    #[test]
+    fn android_linker_fails_loudly_on_undefined_symbols() {
+        let args = android_shared_link_args(
+            Path::new("/tmp/out/libdemo.so"),
+            Path::new("/tmp/out/jni_glue.o"),
+            Path::new("/tmp/out/libdemo.a"),
+            Path::new("/tmp/out/exports.map"),
+            &[],
+        );
+
+        assert!(
+            args.contains(&OsString::from("-Wl,--no-undefined")),
+            "a missing native lib must fail the build instead of shipping a broken .so"
+        );
+    }
+
+    #[test]
+    fn android_linker_includes_extra_link_flags_from_native_static_libs_query() {
+        let extra_link_flags = vec![
+            "-lnativewindow".to_string(),
+            "-L/tmp/search-path".to_string(),
+        ];
+        let args = android_shared_link_args(
+            Path::new("/tmp/out/libdemo.so"),
+            Path::new("/tmp/out/jni_glue.o"),
+            Path::new("/tmp/out/libdemo.a"),
+            Path::new("/tmp/out/exports.map"),
+            &extra_link_flags,
+        );
+
+        assert!(args.contains(&OsString::from("-lnativewindow")));
+        assert!(args.contains(&OsString::from("-L/tmp/search-path")));
+    }
+
+    #[test]
+    fn filter_redundant_hardcoded_libs_drops_only_exact_baseline_matches() {
+        let reported = vec![
+            "-lc".to_string(),
+            "-lm".to_string(),
+            "-lnativewindow".to_string(),
+        ];
+
+        assert_eq!(
+            filter_redundant_hardcoded_libs(&reported),
+            vec!["-lnativewindow".to_string()]
         );
     }
 
@@ -762,8 +943,13 @@ enabled = true
         let library_path = PathBuf::from(OsString::from_vec(b"/tmp/lib-\xFD.a".to_vec()));
         let export_script_path =
             PathBuf::from(OsString::from_vec(b"/tmp/exports-\xFC.map".to_vec()));
-        let args =
-            android_shared_link_args(&dest_path, &object_path, &library_path, &export_script_path);
+        let args = android_shared_link_args(
+            &dest_path,
+            &object_path,
+            &library_path,
+            &export_script_path,
+            &[],
+        );
 
         assert_eq!(
             args[2].as_os_str().as_bytes(),

@@ -145,7 +145,8 @@ pub(crate) fn pack_android(
         )?;
     }
 
-    let packager = AndroidPackager::new(config, android_libraries, build_profile.is_release_like());
+    let packager = AndroidPackager::new(config, android_libraries, build_profile.is_release_like())
+        .with_build_context(binding_expansion.clone(), build_cargo_args.clone());
     let step = reporter.step("Packaging jniLibs");
     packager.package()?;
     step.finish_success();

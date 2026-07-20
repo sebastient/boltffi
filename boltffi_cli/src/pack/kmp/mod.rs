@@ -510,6 +510,10 @@ fn package_kmp_android_libraries(
         plan.build_profile().is_release_like(),
         AndroidBindingMode::KotlinMultiplatform,
         plan.layout().android_native_layout(header_name),
+    )
+    .with_build_context(
+        Some(binding_expansion.clone()),
+        options.execution.cargo_args.clone(),
     );
     let step = reporter.step("Packaging Android jniLibs for Kotlin Multiplatform");
     packager.package()?;
