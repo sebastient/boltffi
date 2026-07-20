@@ -3,7 +3,7 @@
 //! The generated JNI source file includes small runtime fragments only when a
 //! rendered native method needs them. Methods can require status checks,
 //! continuation helpers, exception paths, byte-array helpers, direct-record
-//! array helpers, or callback-handle returns.
+//! array helpers, or callback-handle parameters or returns.
 //!
 //! This module reads the finished method views and records those requirements.
 //! It does not inspect binding IR or decide method support; it only prevents the
@@ -20,6 +20,7 @@ pub struct MethodFeatures {
     pub uses_direct_buffers: bool,
     pub uses_exceptions: bool,
     pub returns_callback_handles: bool,
+    pub accepts_callback_handles: bool,
 }
 
 impl MethodFeatures {
@@ -47,6 +48,12 @@ impl MethodFeatures {
                     || !method.record_buffers.is_empty()
             }),
             returns_callback_handles: methods.iter().any(|method| method.returns_callback),
+            accepts_callback_handles: methods.iter().any(|method| {
+                method
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.is_callback)
+            }),
         }
     }
 }

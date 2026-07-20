@@ -17,6 +17,11 @@ use crate::bridge::{
 pub struct NativeParameterView {
     pub name: Identifier,
     pub ty: TypeFragment,
+    /// Whether this parameter accepts an existing callback object, i.e. it is
+    /// marshaled through `boltffi_jni_callback_parameter`. Feature scans need
+    /// this to know a method body calls that helper even though the method
+    /// itself does not return a callback.
+    pub is_callback: bool,
 }
 
 impl NativeParameterView {
@@ -25,36 +30,44 @@ impl NativeParameterView {
             NativeParameterKind::Scalar(parameter) => vec![Self {
                 name: parameter.name().clone(),
                 ty: parameter.ty().as_type_fragment(),
+                is_callback: false,
             }],
             NativeParameterKind::Bytes(parameter) => vec![
                 Self {
                     name: parameter.name().clone(),
                     ty: TypeFragment::new("jobject"),
+                    is_callback: false,
                 },
                 Self {
                     name: parameter.length().clone(),
                     ty: TypeFragment::new("jint"),
+                    is_callback: false,
                 },
             ],
             NativeParameterKind::DirectVector(parameter) => vec![Self {
                 name: parameter.name().clone(),
                 ty: parameter.array_type(),
+                is_callback: false,
             }],
             NativeParameterKind::Record(parameter) => vec![Self {
                 name: parameter.name().clone(),
                 ty: TypeFragment::new("jobject"),
+                is_callback: false,
             }],
             NativeParameterKind::Callback(parameter) => vec![Self {
                 name: parameter.name().clone(),
                 ty: parameter.ty(),
+                is_callback: true,
             }],
             NativeParameterKind::Closure(parameter) => vec![Self {
                 name: parameter.name().clone(),
                 ty: parameter.ty(),
+                is_callback: false,
             }],
             NativeParameterKind::Continuation(parameter) => vec![Self {
                 name: parameter.name().clone(),
                 ty: parameter.ty(),
+                is_callback: false,
             }],
         }
     }

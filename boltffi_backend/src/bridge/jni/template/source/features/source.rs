@@ -114,7 +114,8 @@ impl SourceFeatures {
                 || callbacks.has_handle_methods
                 || callbacks.returns_callback_handles
                 || closures.returns_callback_handles
-                || methods.returns_callback_handles,
+                || methods.returns_callback_handles
+                || methods.accepts_callback_handles,
             uses_closure_handles,
         }
     }
